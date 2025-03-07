@@ -1,0 +1,74 @@
+Parametres définis pour la simulation : 
+	Taille du terrain : 1
+	Nombre de cellules par direction : 20
+	Vecteur vitesse : [0, 0]
+	Position initiale du foyer (col, ligne) : 10, 10
+Time step 32
+===============
+Time step 32
+--------------------
+Time step 64
+===============
+Time step 64
+--------------------
+Time step 96
+===============
+Time step 96
+--------------------
+Time step 128
+===============
+Time step 128
+--------------------
+Time step 160
+===============
+Time step 160
+--------------------
+Time step 192
+===============
+Time step 192
+--------------------
+Time step 224
+===============
+Time step 224
+--------------------
+Time step 256
+===============
+Time step 256
+--------------------
+Time step 288
+===============
+Time step 288
+--------------------
+Time step 320
+===============
+Time step 320
+--------------------
+Time step 352
+===============
+Time step 352
+--------------------
+Time step 384
+===============
+Time step 384
+--------------------
+Time step 416
+===============
+Time step 416
+--------------------
+Time step 448
+===============
+Time step 448
+--------------------
+Time step 480
+===============
+Time step 480
+--------------------
+Time step 512
+===============
+Time step 512
+--------------------
+Time step 544
+===============
+Time step 544
+--------------------
+TimeData: 0.0580374 0.0365877
