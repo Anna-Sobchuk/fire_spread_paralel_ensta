@@ -4,6 +4,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <mpi.h>
 
 #include "model.hpp"
 #include "display.hpp"
@@ -17,6 +18,14 @@ struct ParamsType
     unsigned discretization{20u};
     std::array<double,2> wind{0.,0.};
     Model::LexicoIndices start{10u,10u};
+
+    void serializable(char* buffer) const {
+        memcpy(buffer, this, sizeof(ParamsType));
+    }
+
+    void deserializable(const char* buffer) {
+        memcpy(this, buffer, sizeof(ParamsType));
+    }
 };
 
 void analyze_arg( int nargs, char* args[], ParamsType& params )
@@ -194,63 +203,104 @@ void display_params(ParamsType const& params)
 
 int main( int nargs, char* args[] )
 {
-    auto params = parse_arguments(nargs-1, &args[1]);
-    display_params(params);
-    if (!check_params(params)) return EXIT_FAILURE;
 
-    auto displayer = Displayer::init_instance( params.discretization, params.discretization );
-    auto simu = Model( params.length, params.discretization, params.wind,
-                       params.start);
-    SDL_Event event;
+    MPI_Init(&nargs, &args);
+    int rank, num_procs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
+    ParamsType params;
+    char param_buffer[sizeof(ParamsType)];
 
-    // Mesure des temps d'execution
-    using clock = std::chrono::high_resolution_clock;
-    double total_time = 0.0;
-    double total_update_time = 0.0;
-    double total_display_time = 0.0;
-    int nb_steps = 0;
-
-    while(true)
-    {
-        auto start_step = clock::now();
-        
-        auto start_update = clock::now();
-        bool continue_sim = simu.update();
-        auto end_update = clock::now();
-
-        if (!continue_sim) break;
-        
-        if ((simu.time_step() & 31) == 0) 
-            std::cout << "Time step " << simu.time_step() << "\n===============" << std::endl;
-        
-        
-        
-        auto start_display = clock::now();
-        displayer->update( simu.vegetal_map(), simu.fire_map() );
-        auto end_display = clock::now();
-        
-        
-
-        // Accumuler les temps
-        total_update_time += std::chrono::duration<double>(end_update - start_update).count();
-        total_display_time += std::chrono::duration<double>(end_display - start_display).count();
-        total_time += std::chrono::duration<double>(end_display - start_step).count();
-        nb_steps++;
-
-        if ((simu.time_step() % 32) == 0){
-            std::cout << "Time step " << simu.time_step()
-                      << "\n--------------------\n";
+    if (rank == 0){
+        params = parse_arguments(nargs-1, &args[1]);
+        if (!check_params(params)){
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
+        params.serializable(param_buffer);
+    }
+    MPI_Bcast(param_buffer, sizeof(ParamsType), MPI_BYTE, 0, MPI_COMM_WORLD);
 
-
-        if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
-            break;
-        std::this_thread::sleep_for(0.1s);
-
+    if(rank != 0) {
+        params.deserializable(param_buffer);
     }
 
-    std::cout << "TimeData: " << total_time/nb_steps << " " << total_update_time/nb_steps << std::endl;
-    
+    if(rank == 0) {
+        try {
+            auto displayer = Displayer::init_instance(params.discretization, params.discretization);
+            
+
+            const int grid_size = params.discretization * params.discretization;
+            std::vector<uint8_t> fire_map(grid_size);
+            std::vector<uint8_t> vegetation_map(grid_size);
+
+            
+            MPI_Request requests[2];
+            MPI_Status statuses[2];
+
+            bool running = true;
+            SDL_Event event;
+
+            while (running) {
+                MPI_Status status;
+
+                MPI_Recv(fire_map.data(), grid_size, MPI_UNSIGNED_CHAR, 1, 0, MPI_COMM_WORLD, &status);
+                MPI_Recv(vegetation_map.data(), grid_size, MPI_UNSIGNED_CHAR, 1, 1, MPI_COMM_WORLD, &status);
+                
+                //MPI_Waitall(2, requests, statuses);
+                //std::cout << "receiving" << (int)fire_map[0] << (int)vegetation_map[0] << std::endl;
+
+                displayer->update(vegetation_map, fire_map);
+
+                if(SDL_PollEvent(&event) && event.type == SDL_QUIT)
+                    running = false;
+
+                std::this_thread::sleep_for(10ms);
+            }
+        }
+        catch(const std::exception& e) {
+            std::cerr << "Display error: " << e.what() << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+    }
+    else {
+        try {
+            Model simu(params.length, params.discretization, params.wind, params.start);
+            const int grid_size = params.discretization * params.discretization;
+
+            assert(simu.fire_map().size() == grid_size);
+            assert(simu.vegetal_map().size() == grid_size);
+
+
+            MPI_Request requests[2];
+            MPI_Status statuses[2];
+            
+            auto start_time = std::chrono::high_resolution_clock::now();
+            int total_steps = 0;
+
+            while (simu.update()) {
+
+                //std::cout << "sending" << (int)simu.fire_map()[0] << (int)simu.vegetal_map()[0] << std::endl;
+
+                MPI_Send(simu.fire_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
+                MPI_Send(simu.vegetal_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 1, MPI_COMM_WORLD);
+
+                //MPI_Waitall(2, requests, statuses);
+                total_steps++;
+                std::this_thread::sleep_for(10ms);
+            }
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> elapsed = end_time - start_time;
+
+            std::cout << "Temps moyen par iteration: " << elapsed.count() / total_steps << " s" << std::endl;
+
+        }
+        catch(const std::exception& e) {
+            std::cerr << "Compute error: " << e.what() << std::endl;
+        }
+    }
+
+    MPI_Finalize();
     return EXIT_SUCCESS;
 }
