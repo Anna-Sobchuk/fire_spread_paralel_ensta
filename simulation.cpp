@@ -275,25 +275,25 @@ int main( int nargs, char* args[] )
             MPI_Request requests[2];
             MPI_Status statuses[2];
             
-            auto start_time = std::chrono::high_resolution_clock::now();
             int total_steps = 0;
+            std::chrono::duration<double> total_time = std::chrono::duration<double>::zero();
 
             while (simu.update()) {
 
                 //std::cout << "sending" << (int)simu.fire_map()[0] << (int)simu.vegetal_map()[0] << std::endl;
 
+                auto start_time = std::chrono::high_resolution_clock::now();
                 MPI_Send(simu.fire_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
                 MPI_Send(simu.vegetal_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 1, MPI_COMM_WORLD);
+                auto end_time = std::chrono::high_resolution_clock::now();
+                total_time += end_time - start_time; 
 
                 //MPI_Waitall(2, requests, statuses);
                 total_steps++;
                 std::this_thread::sleep_for(10ms);
             }
 
-            auto end_time = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double> elapsed = end_time - start_time;
-
-            std::cout << "Temps moyen par iteration: " << elapsed.count() / total_steps << " s" << std::endl;
+            std::cout << "Temps moyen par iteration: " << total_time.count() / total_steps << " s" << std::endl;
 
         }
         catch(const std::exception& e) {
