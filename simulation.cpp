@@ -8,6 +8,7 @@
 
 #include "model.hpp"
 #include "display.hpp"
+#include <omp.h>
 
 using namespace std::string_literals;
 using namespace std::chrono_literals;
@@ -201,9 +202,7 @@ void display_params(ParamsType const& params)
               << "\tPosition initiale du foyer (col, ligne) : " << params.start.column << ", " << params.start.row << std::endl;
 }
 
-int main( int nargs, char* args[] )
-{
-
+int main(int nargs, char* args[]) {
     MPI_Init(&nargs, &args);
     int rank, num_procs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -212,31 +211,23 @@ int main( int nargs, char* args[] )
     ParamsType params;
     char param_buffer[sizeof(ParamsType)];
 
-    if (rank == 0){
-        params = parse_arguments(nargs-1, &args[1]);
-        if (!check_params(params)){
+    if (rank == 0) {
+        params = parse_arguments(nargs - 1, &args[1]);
+        if (!check_params(params)) {
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
         params.serializable(param_buffer);
     }
     MPI_Bcast(param_buffer, sizeof(ParamsType), MPI_BYTE, 0, MPI_COMM_WORLD);
 
-    if(rank != 0) {
-        params.deserializable(param_buffer);
-    }
+    auto global_start = std::chrono::high_resolution_clock::now(); // Початок глобального таймера
 
-    if(rank == 0) {
+    if (rank == 0) {
         try {
             auto displayer = Displayer::init_instance(params.discretization, params.discretization);
-            
-
             const int grid_size = params.discretization * params.discretization;
             std::vector<uint8_t> fire_map(grid_size);
             std::vector<uint8_t> vegetation_map(grid_size);
-
-            
-            MPI_Request requests[2];
-            MPI_Status statuses[2];
 
             bool running = true;
             SDL_Event event;
@@ -246,19 +237,16 @@ int main( int nargs, char* args[] )
 
                 MPI_Recv(fire_map.data(), grid_size, MPI_UNSIGNED_CHAR, 1, 0, MPI_COMM_WORLD, &status);
                 MPI_Recv(vegetation_map.data(), grid_size, MPI_UNSIGNED_CHAR, 1, 1, MPI_COMM_WORLD, &status);
-                
-                //MPI_Waitall(2, requests, statuses);
-                //std::cout << "receiving" << (int)fire_map[0] << (int)vegetation_map[0] << std::endl;
 
                 displayer->update(vegetation_map, fire_map);
 
-                if(SDL_PollEvent(&event) && event.type == SDL_QUIT)
+                if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
                     running = false;
 
-                std::this_thread::sleep_for(10ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
-        catch(const std::exception& e) {
+        catch (const std::exception& e) {
             std::cerr << "Display error: " << e.what() << std::endl;
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
@@ -271,32 +259,66 @@ int main( int nargs, char* args[] )
             assert(simu.fire_map().size() == grid_size);
             assert(simu.vegetal_map().size() == grid_size);
 
-
-            MPI_Request requests[2];
-            MPI_Status statuses[2];
-            
             int total_steps = 0;
-            std::chrono::duration<double> total_time = std::chrono::duration<double>::zero();
+            double total_time = 0.0;
+            auto simu_start = std::chrono::high_resolution_clock::now(); // Початок таймера симуляції
 
-            while (simu.update()) {
+            bool simulation_running = true;
 
-                //std::cout << "sending" << (int)simu.fire_map()[0] << (int)simu.vegetal_map()[0] << std::endl;
+            #pragma omp parallel
+            {
+                while (simulation_running) {
+                    auto step_start = std::chrono::high_resolution_clock::now();
 
-                auto start_time = std::chrono::high_resolution_clock::now();
-                MPI_Send(simu.fire_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
-                MPI_Send(simu.vegetal_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 1, MPI_COMM_WORLD);
-                auto end_time = std::chrono::high_resolution_clock::now();
-                total_time += end_time - start_time; 
+                    #pragma omp single
+                    {
+                        if (!simu.update()) {
+                            simulation_running = false;
+                        }
+                    }
 
-                //MPI_Waitall(2, requests, statuses);
-                total_steps++;
-                std::this_thread::sleep_for(10ms);
+                    #pragma omp barrier // Синхронізація потоків перед відправкою даних
+
+                    if (!simulation_running) break;
+
+                    #pragma omp single
+                    {
+                        MPI_Request requests[2];
+                        MPI_Isend(simu.fire_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD, &requests[0]);
+                        MPI_Isend(simu.vegetal_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 1, MPI_COMM_WORLD, &requests[1]);
+                        MPI_Waitall(2, requests, MPI_STATUSES_IGNORE);
+                    }
+
+                    auto step_end = std::chrono::high_resolution_clock::now();
+                    double step_time = std::chrono::duration<double>(step_end - step_start).count();
+
+                    #pragma omp atomic
+                    total_time += step_time;
+
+                    total_steps++;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
             }
 
-            std::cout << "Temps moyen par iteration: " << total_time.count() / total_steps << " s" << std::endl;
+            auto simu_end = std::chrono::high_resolution_clock::now();
+            double simu_time = std::chrono::duration<double>(simu_end - simu_start).count();
+
+            auto global_end = std::chrono::high_resolution_clock::now();
+            double global_time = std::chrono::duration<double>(global_end - global_start).count();
+
+            int num_threads = omp_get_max_threads();
+            double speedup_global = 1.0 / (global_time / num_threads);
+            double speedup_simu = 1.0 / (simu_time / num_threads);
+
+            std::cout << "Nombre de threads: " << num_threads << std::endl;
+            std::cout << "Temps total: " << global_time << " s" << std::endl;
+            std::cout << "Temps simulation: " << simu_time << " s" << std::endl;
+            std::cout << "Temps moyen par iteration: " << total_time / total_steps << " s" << std::endl;
+            std::cout << "Accélération globale: " << speedup_global << "x" << std::endl;
+            std::cout << "Accélération avancée en temps: " << speedup_simu << "x" << std::endl;
 
         }
-        catch(const std::exception& e) {
+        catch (const std::exception& e) {
             std::cerr << "Compute error: " << e.what() << std::endl;
         }
     }
