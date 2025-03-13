@@ -2,13 +2,16 @@ include Make_linux.inc
 #include Make_msys2.inc
 #include Make_osx.inc
 
+# Use mpic++ instead of g++
+CXX = mpic++
+
 CXXFLAGS = -std=c++17
 ifdef DEBUG
 CXXFLAGS += -g -O0 -Wall -fbounds-check -pedantic -D_GLIBCXX_DEBUG
 CXXFLAGS2 = CXXFLAGS
 else
 CXXFLAGS2 = ${CXXFLAGS} -O2 -march=native -Wall 
-CXXFLAGS += -O3 -march=native -Wall
+CXXFLAGS += -fopenmp -O3 -march=native -Wall
 endif
 
 ALL= simulation.exe 
