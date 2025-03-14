@@ -206,7 +206,8 @@ void display_params(ParamsType const& params)
               << "\tPosition initiale du foyer (col, ligne) : " << params.start.column << ", " << params.start.row << std::endl;
 }
 
-int main(int nargs, char* args[]) {
+int main(int nargs, char* args[])
+{
     MPI_Init(&nargs, &args);
     int rank, num_procs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -236,6 +237,9 @@ int main(int nargs, char* args[]) {
             std::vector<uint8_t> fire_map(grid_size);
             std::vector<uint8_t> vegetation_map(grid_size);
 
+            MPI_Request requests[2];
+            MPI_Status statuses[2];
+
             bool running = true;
             SDL_Event event;
 
@@ -250,13 +254,15 @@ int main(int nargs, char* args[]) {
                 if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
                     running = false;
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                std::this_thread::sleep_for(10ms);
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e) {
             std::cerr << "Display error: " << e.what() << std::endl;
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
-    } else {
+    }
+    else {
         try {
             Model simu(params.length, params.discretization, params.wind, params.start);
             const int grid_size = params.discretization * params.discretization;
@@ -264,32 +270,36 @@ int main(int nargs, char* args[]) {
             assert(simu.fire_map().size() == grid_size);
             assert(simu.vegetal_map().size() == grid_size);
 
+            MPI_Request requests[2];
+            MPI_Status statuses[2];
+
             int total_steps = 0;
             std::chrono::duration<double> total_time = std::chrono::duration<double>::zero();
-            std::chrono::duration<double> total_advancement_time = std::chrono::duration<double>::zero();
+            std::chrono::duration<double> update_time = std::chrono::duration<double>::zero();
 
-            while (true) {
+            while (simu.update()) {
                 auto start_time = std::chrono::high_resolution_clock::now();
 
-                // **Parallelized update function using OpenMP**
-                bool updated = simu.update();  
+                // Measure time for update method
+                auto update_start = std::chrono::high_resolution_clock::now();
+                bool running = simu.update();
+                auto update_end = std::chrono::high_resolution_clock::now();
+                update_time += update_end - update_start;
 
-                if (!updated) break;  // Stop when fire is out
-
-                auto end_time = std::chrono::high_resolution_clock::now();
-                total_advancement_time += end_time - start_time;
-
-                // **Ensure only one thread sends MPI data**
                 MPI_Send(simu.fire_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 0, MPI_COMM_WORLD);
                 MPI_Send(simu.vegetal_map().data(), grid_size, MPI_UNSIGNED_CHAR, 0, 1, MPI_COMM_WORLD);
 
+                auto end_time = std::chrono::high_resolution_clock::now();
+                total_time += end_time - start_time;
+
                 total_steps++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                std::this_thread::sleep_for(10ms);
             }
 
-            std::cout << "Temps moyen par iteration: " << total_advancement_time.count() / total_steps << " s" << std::endl;
-
-        } catch (const std::exception& e) {
+            std::cout << "Temps moyen par iteration: " << total_time.count() / total_steps << " s" << std::endl;
+            std::cout << "Temps moyen pour update: " << update_time.count() / total_steps << " s" << std::endl;
+        }
+        catch (const std::exception& e) {
             std::cerr << "Compute error: " << e.what() << std::endl;
         }
     }
