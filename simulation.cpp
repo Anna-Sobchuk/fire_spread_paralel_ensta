@@ -4,6 +4,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <mpi.h>
 
 #include "model.hpp"
 #include "display.hpp"
@@ -17,6 +18,14 @@ struct ParamsType
     unsigned discretization{20u};
     std::array<double,2> wind{0.,0.};
     Model::LexicoIndices start{10u,10u};
+
+    void serializable(char* buffer) const {
+        memcpy(buffer, this, sizeof(ParamsType));
+    }
+
+    void deserializable(const char* buffer) {
+        memcpy(this, buffer, sizeof(ParamsType));
+    }
 };
 
 void analyze_arg( int nargs, char* args[], ParamsType& params )
@@ -192,65 +201,121 @@ void display_params(ParamsType const& params)
               << "\tPosition initiale du foyer (col, ligne) : " << params.start.column << ", " << params.start.row << std::endl;
 }
 
-int main( int nargs, char* args[] )
-{
-    auto params = parse_arguments(nargs-1, &args[1]);
-    display_params(params);
-    if (!check_params(params)) return EXIT_FAILURE;
+int main(int nargs, char* args[]) {
+    MPI_Init(&nargs, &args);
+    int rank, num_procs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-    auto displayer = Displayer::init_instance( params.discretization, params.discretization );
-    auto simu = Model( params.length, params.discretization, params.wind,
-                       params.start);
-    SDL_Event event;
+    // Création du groupe de calcul
+    MPI_Comm compute_comm;
+    MPI_Group world_group, compute_group;
+    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+    int exclude[] = {0};
+    MPI_Group_excl(world_group, (rank == 0) ? 0 : 1, exclude, &compute_group);
+    MPI_Comm_create(MPI_COMM_WORLD, compute_group, &compute_comm);
 
+    ParamsType params;
+    char param_buffer[sizeof(ParamsType)];
 
-    // Mesure des temps d'execution
-    using clock = std::chrono::high_resolution_clock;
-    double total_time = 0.0;
-    double total_update_time = 0.0;
-    double total_display_time = 0.0;
-    int nb_steps = 0;
-
-    while(true)
-    {
-        auto start_step = clock::now();
-        
-        auto start_update = clock::now();
-        bool continue_sim = simu.update();
-        auto end_update = clock::now();
-
-        if (!continue_sim) break;
-        
-        if ((simu.time_step() & 31) == 0) 
-            std::cout << "Time step " << simu.time_step() << "\n===============" << std::endl;
-        
-        
-        
-        auto start_display = clock::now();
-        displayer->update( simu.vegetal_map(), simu.fire_map() );
-        auto end_display = clock::now();
-        
-        
-
-        // Accumuler les temps
-        total_update_time += std::chrono::duration<double>(end_update - start_update).count();
-        total_display_time += std::chrono::duration<double>(end_display - start_display).count();
-        total_time += std::chrono::duration<double>(end_display - start_step).count();
-        nb_steps++;
-
-        if ((simu.time_step() % 32) == 0){
-            std::cout << "Time step " << simu.time_step()
-                      << "\n--------------------\n";
+    if(rank == 0) {
+        params = parse_arguments(nargs-1, &args[1]);
+        if (!check_params(params)){
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
+        params.serializable(param_buffer);
+            // Préparation pour MPI_Gatherv
+            std::vector<int> counts(num_procs-1), displs(num_procs-1);
+            int offset = 0;
+            for(int i=1; i<num_procs; i++) {
+                counts[i-1] = /* calcul de la taille locale */;
+                displs[i-1] = offset;
+                offset += counts[i-1];
+        }
+    }
+    MPI_Bcast(param_buffer, sizeof(ParamsType), MPI_BYTE, 0, MPI_COMM_WORLD);
 
-
-        if (SDL_PollEvent(&event) && event.type == SDL_QUIT)
-            break;
-        std::this_thread::sleep_for(0.1s);
-
+    if(rank != 0) {
+        params.deserializable(param_buffer);
     }
 
-    std::cout << "TimeData: " << total_time/nb_steps << " " << total_update_time/nb_steps << std::endl;
-    
+    if (rank == 0) {
+        try {
+            // Initialisation de l'affichage
+            auto displayer = Displayer::init_instance(params.discretization, params.discretization);
+            
+            // Préparation pour MPI_Gatherv
+            std::vector<int> counts(num_procs-1), displs(num_procs-1);
+            int offset = 0;
+            for(int i=1; i<num_procs; i++) {
+                int local_size = /* calculer la taille locale du processus i */;
+                counts[i-1] = local_size;
+                displs[i-1] = offset;
+                offset += local_size;
+            }
+        
+            std::vector<uint8_t> fire_map(params.discretization * params.discretization);
+            std::vector<uint8_t> vegetation_map(params.discretization * params.discretization);
+        
+            while(running) {
+                // Collecte des données
+                MPI_Gatherv(nullptr, 0, MPI_DATATYPE_NULL,
+                        fire_map.data(), counts.data(), displs.data(), MPI_UNSIGNED_CHAR,
+                        0, MPI_COMM_WORLD);
+                
+                // Mise à jour de l'affichage
+                displayer->update(vegetation_map, fire_map);
+                
+                // Gestion des événements SDL
+                if(SDL_PollEvent(&event) && event.type == SDL_QUIT) running = false;
+                std::this_thread::sleep_for(10ms);
+        }
+    }
+        catch(const std::exception& e) {
+            std::cerr << "Display error: " << e.what() << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+    }
+    else {
+        try {
+            // Découpage du domaine
+            int N = params.discretization;
+            int rows_per_proc = N / (num_procs-1);
+            int start_row = (rank-1) * rows_per_proc;
+            int end_row = (rank == num_procs-1) ? N : start_row + rows_per_proc;
+
+            // Ajout des fantômes
+            start_row = std::max(start_row - 1, 0);
+            end_row = std::min(end_row + 1, N);
+
+            // Création du modèle local
+            Model simu(
+                params.length, 
+                params.discretization, 
+                params.wind, 
+                params.start,
+                60.0,          // t_max_wind
+                start_row,     // t_local_start
+                end_row        // t_local_end
+            );
+
+            while(simu.update()) {
+                simu.exchange_ghosts(); // Échange des cellules fantômes
+                
+                // Envoi des données au maître via Gatherv
+                MPI_Gatherv(simu.fire_map().data(), simu.fire_map().size(), MPI_UNSIGNED_CHAR,
+                        nullptr, nullptr, nullptr, MPI_UNSIGNED_CHAR, 
+                        0, MPI_COMM_WORLD);
+            }
+
+            std::cout << "Temps moyen par iteration: " << total_time.count() / total_steps << " s" << std::endl;
+
+        }
+        catch(const std::exception& e) {
+            std::cerr << "Compute error: " << e.what() << std::endl;
+        }
+    }
+
+    MPI_Finalize();
     return EXIT_SUCCESS;
 }
